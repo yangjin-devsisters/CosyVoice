@@ -13,15 +13,18 @@ import logging
 import signal
 
 # --- 요청 데이터 구조 정의 ---
+# ▼▼▼ [핵심 수정] language, speed 필드 추가 ▼▼▼
 class TTSRequest(BaseModel):
     text: str
     output_filename: str
     absolute_path: Optional[str] = None
     prompt_speaker_path: Optional[str] = None
     instruction: Optional[str] = None
+    language: Optional[str] = 'ko' # 기본값 'ko'
+    speed: Optional[float] = 1.0   # 기본값 1.0
 
 app = FastAPI()
-server_instance = None 
+server_instance = None
 
 # --- CosyVoice 모델 로드 ---
 sys.path.append('third_party/Matcha-TTS')
@@ -62,6 +65,9 @@ async def generate_tts(request: TTSRequest):
     app.logger.info(f"Text: {text}")
     app.logger.info(f"Filename: {output_filename}")
     app.logger.info(f"Instruction: {request.instruction}")
+    # ▼▼▼ [핵심 수정] 수신된 language, speed 로깅 ▼▼▼
+    app.logger.info(f"Language: {request.language}")
+    app.logger.info(f"Speed: {request.speed}")
     
     prompt_text = ""
     
@@ -75,10 +81,24 @@ async def generate_tts(request: TTSRequest):
     try:
         app.logger.info("Starting TTS inference...")
         
+        # ▼▼▼ [핵심 수정] cosyvoice inference 함수 호출 시 language와 speed 전달 ▼▼▼
+        # (참고: cosyvoice 라이브러리가 실제로 이 파라미터를 지원해야 합니다.)
         if request.instruction:
-            output_iterator = cosyvoice.inference_instruct2(request.text, request.instruction, prompt_speech_16k)
+            output_iterator = cosyvoice.inference_instruct2(
+                request.text, 
+                request.instruction, 
+                prompt_speech_16k,
+                # language=request.language, # 모델이 지원하는 경우 주석 해제
+                # speed=request.speed      # 모델이 지원하는 경우 주석 해제
+            )
         else:
-            output_iterator = cosyvoice.inference_zero_shot(request.text, prompt_text, prompt_speech_16k)
+            output_iterator = cosyvoice.inference_zero_shot(
+                request.text, 
+                prompt_text, 
+                prompt_speech_16k,
+                # language=request.language, # 모델이 지원하는 경우 주석 해제
+                # speed=request.speed      # 모델이 지원하는 경우 주석 해제
+            )
         
         saved = False
         for i, chunk in enumerate(output_iterator):
