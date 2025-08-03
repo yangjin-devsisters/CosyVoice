@@ -1,4 +1,4 @@
-# ... (상단 import 구문들은 이전과 동일) ...
+# api_server.py
 import sys
 from fastapi import FastAPI, HTTPException
 import torchaudio
@@ -9,99 +9,106 @@ from pydantic import BaseModel
 from typing import Optional
 import threading
 import time
-import logging # 로깅 라이브러리 추가
+import logging
+import signal
 
 # --- 요청 데이터 구조 정의 ---
 class TTSRequest(BaseModel):
     text: str
     output_filename: str
     absolute_path: Optional[str] = None
+    prompt_speaker_path: Optional[str] = None
+    instruction: Optional[str] = None
 
-shutdown_event = threading.Event()
 app = FastAPI()
+server_instance = None 
 
 # --- CosyVoice 모델 로드 ---
 sys.path.append('third_party/Matcha-TTS')
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from cosyvoice.utils.file_utils import load_wav
 
-print("Loading CosyVoice2-0.5B model from local path...")
+print("Loading CosyVoice2-0.5B model...")
 cosyvoice = CosyVoice2('pretrained_models/CosyVoice2-0.5B')
 print("Model loaded successfully.")
 
 default_output_dir = "tts_outputs_fallback"
 os.makedirs(default_output_dir, exist_ok=True)
+default_prompt_path = './asset/zero_shot_prompt.wav'
 
 
-# --- API 엔드포인트들 (이전과 동일) ---
 @app.get("/status")
 def get_status():
     return {"status": "running"}
 
 @app.post("/shutdown")
-def shutdown_server():
-    shutdown_event.set()
+async def shutdown_server():
+    global server_instance
+    if server_instance:
+        server_instance.should_exit = True
+        server_instance.force_exit = True
+        await server_instance.shutdown()
     return {"message": "Server is shutting down."}
 
 @app.post("/generate-tts")
 async def generate_tts(request: TTSRequest):
-    # ... (generate-tts 함수 내용은 이전과 동일) ...
     text = request.text
     output_filename = request.output_filename
     
-    if request.absolute_path:
-        output_dir = request.absolute_path
-        os.makedirs(output_dir, exist_ok=True)
-    else:
-        output_dir = default_output_dir
+    output_dir = request.absolute_path or default_output_dir
+    os.makedirs(output_dir, exist_ok=True)
     
     app.logger.info("\n--- New TTS Request ---")
-    app.logger.info(f"[1/5] Received Text: {text}")
-    app.logger.info(f"[2/5] Received Filename: {output_filename}")
-    app.logger.info(f"[INFO] Target directory: {output_dir}")
+    app.logger.info(f"Text: {text}")
+    app.logger.info(f"Filename: {output_filename}")
+    app.logger.info(f"Instruction: {request.instruction}")
     
-    prompt_text = "안녕하세요, 제 목소리 어때요?"
-    prompt_speech_16k = load_wav('./asset/zero_shot_prompt.wav', 16000)
+    prompt_text = ""
+    
+    if request.prompt_speaker_path and os.path.exists(request.prompt_speaker_path):
+        app.logger.info(f"Using custom voice: {request.prompt_speaker_path}")
+        prompt_speech_16k = load_wav(request.prompt_speaker_path, 16000)
+    else:
+        app.logger.info(f"Using default voice: {default_prompt_path}")
+        prompt_speech_16k = load_wav(default_prompt_path, 16000)
 
     try:
-        app.logger.info("[3/5] Starting TTS inference...")
-        output_iterator = cosyvoice.inference_zero_shot(text, prompt_text, prompt_speech_16k)
+        app.logger.info("Starting TTS inference...")
         
-        app.logger.info("[4/5] Iterating through inference output...")
+        if request.instruction:
+            output_iterator = cosyvoice.inference_instruct2(request.text, request.instruction, prompt_speech_16k)
+        else:
+            output_iterator = cosyvoice.inference_zero_shot(request.text, prompt_text, prompt_speech_16k)
+        
         saved = False
         for i, chunk in enumerate(output_iterator):
-            app.logger.info(f"  - Found chunk {i}. Shape: {chunk['tts_speech'].shape}")
             save_path = os.path.join(output_dir, output_filename)
-            app.logger.info(f"  - Attempting to save to: {os.path.abspath(save_path)}")
+            app.logger.info(f"  - Saving chunk {i} to: {os.path.abspath(save_path)}")
             torchaudio.save(save_path, chunk['tts_speech'], cosyvoice.sample_rate)
-            app.logger.info(f"  - File saved successfully.")
             saved = True
         
-        if not saved: app.logger.warning("[WARNING] Inference completed, but no audio chunks were generated or saved.")
-        app.logger.info("[5/5] Request processing finished.")
+        if not saved: app.logger.warning("No audio chunks were generated.")
+        app.logger.info("Request processing finished.")
         return {"status": "success", "path": output_filename}
 
     except Exception as e:
         app.logger.error(f"[FATAL ERROR] An exception occurred: {e}")
         import traceback
         app.logger.error(traceback.format_exc())
-        return {"status": "error", "message": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
-# --- 서버 실행 및 종료 로직 수정 ---
+class Server(uvicorn.Server):
+    def handle_exit(self, sig: int, frame) -> None:
+        self.should_exit = True
+
 def run_server():
-    # Uvicorn의 로그 설정을 변경하여 INFO 레벨은 stdout으로, ERROR는 stderr로 보내도록 설정
-    log_config = uvicorn.config.LOGGING_CONFIG
-    log_config["formatters"]["access"]["fmt"] = "%(asctime)s - %(levelname)s - %(message)s"
-    log_config["formatters"]["default"]["fmt"] = "%(asctime)s - %(levelname)s - %(message)s"
-    uvicorn.run(app, host="127.0.0.1", port=9881, log_config=log_config)
-
-if __name__ == "__main__":
-    # FastAPI 앱에 로거 추가
+    global server_instance
+    config = uvicorn.Config(app, host="127.0.0.1", port=9881, log_level="info")
+    server_instance = Server(config=config)
+    
     app.logger = logging.getLogger("uvicorn.error")
     
-    server_thread = threading.Thread(target=run_server)
-    server_thread.start()
-    print("Server started in a background thread.")
-    
-    shutdown_event.wait()
-    print("Shutting down server.")
+    server_instance.run()
+
+if __name__ == "__main__":
+    run_server()
